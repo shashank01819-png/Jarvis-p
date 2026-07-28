@@ -1,0 +1,245 @@
+import os
+import sys
+import re
+import time
+import speech_recognition as sr
+import pyttsx3
+from gtts import gTTS
+import pygame
+import pyautogui
+import AppOpener
+from deep_translator import GoogleTranslator
+from openai import OpenAI
+from duckduckgo_search import DDGS
+# ---------------------------------------------------------
+# CONFIGURATION & API SETUP
+# ---------------------------------------------------------
+DEEPSEEK_API_KEY = "YOUR_API_KEY_HERE"
+
+# Initialize OpenAI-compatible client for DeepSeek-R1
+client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com"
+)
+
+# Initialize local offline TTS engine (English fallback)
+engine = pyttsx3.init()
+engine.setProperty('rate', 175)
+
+# Initialize Pygame Mixer for multilingual audio playback
+pygame.mixer.init()
+
+
+# ---------------------------------------------------------
+# SPEECH & AUDIO MODULES
+# ---------------------------------------------------------
+def speak(text, lang='en'):
+    """
+    Speaks text in multiple languages. Uses gTTS for multilingual support
+    (Hindi, Chinese, Russian, Japanese) and pyttsx3 for fast English responses.
+    """
+    print(f"\n[JARVIS]: {text}")
+
+    if lang != 'en':
+        try:
+            tts = gTTS(text=text, lang=lang, slow=False)
+            filename = "temp_speech.mp3"
+            tts.save(filename)
+
+            pygame.mixer.music.load(filename)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.1)
+
+            pygame.mixer.music.unload()
+            os.remove(filename)
+            return
+        except Exception as e:
+            print(f"[TTS Warning]: gTTS failed, falling back to local engine. Error: {e}")
+
+    engine.say(text)
+    engine.runAndWait()
+
+def listen():
+    """
+    Captures voice input via microphone and returns text.
+    """
+    recognizer = sr.Recognizer()
+
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+    recognizer.pause_threshold = 1.0
+    recognizer.non_speaking_duration = 0.5
+
+    with sr.Microphone() as source:
+        print("🎤 Microphone detected.")
+        print("\n[Listening...]")
+
+        print("Calibrating microphone...")
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+        print("Calibration complete.")
+
+        try:
+            print("Speak now...")
+
+            audio = recognizer.listen(
+                source,
+                timeout=None,
+                phrase_time_limit=10
+            )
+
+            print("Voice captured.")
+
+            print("[Processing Speech...]")
+
+            query = recognizer.recognize_google(
+                audio,
+                language="en-IN",
+                show_all=False
+            )
+
+            print(f"[User]: {query}")
+            print("Speech recognized successfully.")
+            return query
+
+        except sr.WaitTimeoutError:
+            print("[Error] Listening timed out.")
+            return ""
+
+        except sr.UnknownValueError:
+            print("[Error] Could not understand audio.")
+            return ""
+
+        except sr.RequestError as e:
+            print(f"[Speech Recognition Error]: {e}")
+            return ""
+
+        except Exception as e:
+            print(f"[Unexpected Error]: {e}")
+            return ""
+# ---------------------------------------------------------
+# PC CONTROL & TOOLS MODULE
+# ---------------------------------------------------------
+def fetch_realtime_info(query):
+    """Fetches real-time web search results using DuckDuckGo."""
+    print(f"[Searching Web]: {query}")
+    try:
+        results = DDGS().text(query, max_results=3)
+        summary = " ".join([r['body'] for r in results])
+        return summary if summary else "No relevant information found."
+    except Exception as e:
+        return f"Failed to fetch live search data: {e}"
+
+
+def execute_pc_command(command_str):
+    """Executes automated system commands on your computer."""
+    cmd = command_str.lower().strip()
+
+    if "open " in cmd:
+        app_name = cmd.replace("open ", "").strip()
+        speak(f"Opening {app_name}")
+        AppOpener.open(app_name, match_closest=True)
+        return f"Opened {app_name}."
+
+    elif "screenshot" in cmd:
+        filename = f"screenshot_{int(time.time())}.png"
+        pyautogui.screenshot(filename)
+        speak("Screenshot taken and saved.")
+        return f"Screenshot saved as {filename}."
+
+    elif "volume up" in cmd:
+        pyautogui.press("volumeup", presses=5)
+        speak("Increasing volume.")
+        return "Volume increased."
+
+    elif "volume down" in cmd:
+        pyautogui.press("volumedown", presses=5)
+        speak("Decreasing volume.")
+        return "Volume decreased."
+
+    elif "mute" in cmd:
+        pyautogui.press("volumemute")
+        speak("Toggled mute.")
+        return "Mute toggled."
+
+    return "Unknown command."
+
+
+# ---------------------------------------------------------
+# DEEPSEEK-R1 API REASONING ENGINE
+# ---------------------------------------------------------
+SYSTEM_PROMPT = """
+You are JARVIS, an advanced AI desktop assistant.
+You can answer queries, analyze real-time data, and execute PC commands.
+
+If the user asks for real-time information (e.g., weather, news, stock prices), respond ONLY with:
+SEARCH: <search query>
+
+If the user requests a PC operation (open app, adjust volume, screenshot), respond ONLY with:
+EXECUTE: <open app_name | screenshot | volume up | volume down | mute>
+
+Otherwise, provide a direct, concise response in the language spoken by the user (English, Hindi, Chinese, Russian, Japanese, etc.).
+"""
+
+
+def query_jarvis(user_input):
+    """Sends prompt to DeepSeek-R1 API and routes execution."""
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-reasoner",  # DeepSeek-R1 Model
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_input}
+            ]
+        )
+
+        # Strip DeepSeek-R1 internal thinking chain if present
+        raw_output = response.choices[0].message.content.strip()
+        clean_output = re.sub(r'<thought>.*?</thought>', '', raw_output, flags=re.DOTALL).strip()
+
+        # Route actions based on DeepSeek decisions
+        if clean_output.startswith("SEARCH:"):
+            search_query = clean_output.replace("SEARCH:", "").strip()
+            web_data = fetch_realtime_info(search_query)
+
+            # Re-query DeepSeek with live context
+            followup = client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[
+                    {"role": "system", "content": "Synthesize the following real-time data concisely for the user."},
+                    {"role": "user", "content": f"User Request: {user_input}\nWeb Data: {web_data}"}
+                ]
+            )
+            final_reply = re.sub(r'<thought>.*?</thought>', '', followup.choices[0].message.content,
+                                 flags=re.DOTALL).strip()
+            return final_reply, 'en'
+
+        elif clean_output.startswith("EXECUTE:"):
+            cmd = clean_output.replace("EXECUTE:", "").strip()
+            result = execute_pc_command(cmd)
+            return result, 'en'
+
+        return clean_output, 'en'
+
+    except Exception as e:
+        return f"API Error: {e}", 'en'
+
+
+# ---------------------------------------------------------
+# MAIN EXECUTION LOOP
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    speak("JARVIS system initialized. How can I assist you?")
+
+    while True:
+        user_query = listen()
+
+        if not user_query:
+            continue
+
+        if "exit" in user_query.lower() or "quit" in user_query.lower() or "shutdown" in user_query.lower():
+            speak("Shutting down JARVIS. Goodbye.")
+            sys.exit()
+
+        reply, lang_code = query_jarvis(user_query)
+        speak(reply, lang=lang_code)
