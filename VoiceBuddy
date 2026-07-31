@@ -1,0 +1,404 @@
+import speech_recognition as sr
+print(sr.Microphone.list_microphone_names())
+import speech_recognition as sr
+
+recognizer = sr.Recognizer()
+mic_list = sr.Microphone.list_microphone_names()
+print("Available microphones:")
+for i, name in enumerate(mic_list):
+    print(f"{i}: {name}")
+import asyncio
+import edge_tts
+import random
+import speech_recognition as sr
+import requests
+import json
+import os
+import uuid
+import threading
+import tkinter as tk
+from datetime import datetime
+import webbrowser
+import subprocess
+import pygame
+
+pygame.mixer.init()
+recognizer = sr.Recognizer()
+
+REMINDER_FILE = "reminders.json"
+CURRENT_TASK_FILE = "current_task.json"
+conversation_history = []
+MAX_HISTORY = 10
+
+SPEECH_RATE = "+0%"
+SPEECH_VOLUME = "+0%"
+
+KNOWN_PLACES = {
+    "downloads": "C:\\Users\\----\\Downloads",
+    "documents": "C:\\Users\\----\\Documents",
+    "desktop": "C:\\Users\\----\\Desktop",
+    "music": "C:\\Users\\----\\Music",
+}
+
+# ---------------- GUI ----------------
+class AssistantGUI:
+    STATE_COLORS = {
+        "idle": "#555555",
+        "listening": "#3ba9f0",
+        "thinking": "#e0a020",
+        "speaking": "#2ecc71",
+    }
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Buddy")
+        self.root.geometry("160x160+80+80")
+        self.root.overrideredirect(True)  # no title bar
+        self.root.attributes("-topmost", True)
+        self.root.configure(bg="black")
+        self.root.attributes("-transparentcolor", "black")
+
+        self.canvas = tk.Canvas(self.root, width=160, height=160, bg="black", highlightthickness=0)
+        self.canvas.pack()
+
+        self.state = "idle"
+        self.radius = 40
+        self.growing = True
+
+        self.label = tk.Label(self.root, text="Buddy", fg="white", bg="black", font=("Segoe UI", 9))
+        self.label.place(x=55, y=140)
+
+        # allow dragging the widget
+        self.root.bind("<Button-1>", self._start_move)
+        self.root.bind("<B1-Motion>", self._do_move)
+
+        self._animate()
+
+    def _start_move(self, event):
+        self._x = event.x
+        self._y = event.y
+
+    def _do_move(self, event):
+        x = self.root.winfo_pointerx() - self._x
+        y = self.root.winfo_pointery() - self._y
+        self.root.geometry(f"+{x}+{y}")
+
+    def set_state(self, state):
+        self.state = state
+
+    def _animate(self):
+        self.canvas.delete("all")
+        color = self.STATE_COLORS.get(self.state, "#555555")
+
+        if self.state in ("listening", "speaking"):
+            if self.growing:
+                self.radius += 1
+                if self.radius >= 50:
+                    self.growing = False
+            else:
+                self.radius -= 1
+                if self.radius <= 35:
+                    self.growing = True
+        else:
+            self.radius = 40
+
+        cx, cy = 80, 70
+        self.canvas.create_oval(cx - self.radius, cy - self.radius, cx + self.radius, cy + self.radius, fill=color, outline="")
+
+        self.root.after(30, self._animate)
+
+    def run(self):
+        self.root.mainloop()
+
+gui = AssistantGUI()
+
+# ---------------- Voice / AI functions ----------------
+
+async def _speak_async(text):
+    filename = f"temp_voice_{uuid.uuid4().hex}.mp3"
+    try:
+        communicate = edge_tts.Communicate(text, "en-US-JennyNeural", rate=SPEECH_RATE, volume=SPEECH_VOLUME)
+        await communicate.save(filename)
+        pygame.mixer.music.load(filename)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            await asyncio.sleep(0.1)
+        pygame.mixer.music.unload()
+    except Exception as e:
+        print(f"Voice error: {e}")
+    finally:
+        if os.path.exists(filename):
+            os.remove(filename)
+
+def speak(text):
+    print(f"Assistant: {text}")
+    gui.set_state("speaking")
+    asyncio.run(_speak_async(text))
+    gui.set_state("idle")
+
+def listen():
+    gui.set_state("listening")
+    with sr.Microphone() as source:
+        print("Listening...")
+        try:
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
+        except sr.WaitTimeoutError:
+            gui.set_state("idle")
+            return ""
+    gui.set_state("idle")
+    try:
+        text = recognizer.recognize_google(audio)
+        print(f"You said: {text}")
+        return text.lower()
+    except sr.UnknownValueError:
+        return ""
+    except sr.RequestError:
+        speak("I'm having trouble connecting to the internet right now.")
+        return ""
+    except Exception:
+        return ""
+
+def ask_ai(prompt):
+    global conversation_history
+    gui.set_state("thinking")
+    system_prompt = (
+        "You are a warm, friendly assistant who talks like a close friend. "
+        "Keep replies short, casual, and conversational — no long explanations "
+        "or numbered steps unless specifically asked. Use natural, relaxed language. "
+        "Use the conversation history to stay consistent with what was said earlier."
+    )
+    history_text = ""
+    for turn in conversation_history[-MAX_HISTORY:]:
+        history_text += f"User: {turn['user']}\nFriend: {turn['assistant']}\n"
+
+    full_prompt = f"{system_prompt}\n\n{history_text}User: {prompt}\nFriend:"
+
+    try:
+        response = requests.post('http://localhost:11434/api/generate', json={
+            "model": "phi3",
+            "prompt": full_prompt,
+            "stream": False,
+            "keep_alive": -1
+        }, timeout=30)
+        response.raise_for_status()
+        reply = response.json()['response']
+    except requests.exceptions.ConnectionError:
+        gui.set_state("idle")
+        return "I can't reach my thinking engine right now — is Ollama running?"
+    except requests.exceptions.Timeout:
+        gui.set_state("idle")
+        return "That took too long to think about — can you try again?"
+    except Exception:
+        gui.set_state("idle")
+        return "Something went wrong on my end, sorry about that."
+
+    conversation_history.append({"user": prompt, "assistant": reply})
+    if len(conversation_history) > MAX_HISTORY:
+        conversation_history = conversation_history[-MAX_HISTORY:]
+
+    gui.set_state("idle")
+    return reply
+
+def load_reminders():
+    if os.path.exists(REMINDER_FILE):
+        with open(REMINDER_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_reminder(task):
+    reminders = load_reminders()
+    reminders.append({"task": task, "created": str(datetime.now())})
+    with open(REMINDER_FILE, 'w') as f:
+        json.dump(reminders, f)
+
+def list_reminders():
+    reminders = load_reminders()
+    if not reminders:
+        speak("You have no reminders.")
+        return
+    speak(f"You have {len(reminders)} reminders.")
+    for r in reminders:
+        speak(r['task'])
+
+def save_current_task(task):
+    with open(CURRENT_TASK_FILE, 'w') as f:
+        json.dump({"task": task, "saved_at": str(datetime.now())}, f)
+
+def load_current_task():
+    if os.path.exists(CURRENT_TASK_FILE):
+        with open(CURRENT_TASK_FILE, 'r') as f:
+            return json.load(f)
+    return None
+
+def search_google(query):
+    try:
+        url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        if data.get("AbstractText"):
+            return data["AbstractText"]
+        elif data.get("RelatedTopics") and len(data["RelatedTopics"]) > 0:
+            first = data["RelatedTopics"][0]
+            return first.get("Text", "I couldn't find a clear answer.")
+        else:
+            return "I couldn't find a quick answer, want me to open a browser search instead?"
+    except requests.exceptions.ConnectionError:
+        return "I can't search right now, looks like the internet's down."
+    except Exception:
+        return "Something went wrong with the search."
+
+def get_weather(city="Bengaluru"):
+    try:
+        url = f"https://wttr.in/{city}?format=%C+%t"
+        r = requests.get(url, timeout=5)
+        return f"It's currently {r.text.strip()} in {city}."
+    except requests.exceptions.ConnectionError:
+        return "I can't check the weather right now, no internet connection."
+    except Exception:
+        return "I couldn't fetch the weather right now."
+
+def close_app(app_name):
+    app_map = {
+        "chrome": "chrome.exe",
+        "notepad": "notepad.exe",
+        "word": "WINWORD.EXE",
+        "excel": "EXCEL.EXE",
+        "spotify": "Spotify.exe",
+    }
+    exe = app_map.get(app_name)
+    if exe:
+        os.system(f"taskkill /f /im {exe}")
+        return f"Closed {app_name}."
+    else:
+        return f"I don't know how to close {app_name} yet."
+
+# ---------------- Main assistant loop (runs in background thread) ----------------
+def run_assistant():
+    global SPEECH_RATE, SPEECH_VOLUME
+
+    try:
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source)
+    except Exception:
+        print("Warning: microphone calibration failed.")
+
+    greetings = ["Hey buddy!", "Yo, what's up?", "Hi there!", "Hello friend!"]
+    speak(random.choice(greetings))
+
+    last_task = load_current_task()
+    if last_task:
+        speak(f"Last time you were working on something {last_task['task']}. Do you want me to continue that?")
+        answer = listen()
+        if "yes" in answer:
+            speak("Great, come on then lets finish it.")
+        elif "no" in answer:
+            speak("No worries, then whats new today buddy.")
+        else:
+            speak("Okay, we can talk about that later.")
+
+    while True:
+        command = listen()
+
+        if command == "":
+            continue
+
+        if "shutdown" in command or "stop" in command:
+            speak("Goodbye!")
+            break
+
+        elif "remind me" in command:
+            task = command.replace("remind me to", "").replace("remind me", "").strip()
+            save_reminder(task)
+            speak(f"Yep, I'll remind you: {task}")
+
+        elif "what are my reminders" in command or "list reminders" in command:
+            list_reminders()
+
+        elif "i am working on" in command or "i'm working on" in command:
+            task = command.replace("i am working on", "").replace("i'm working on", "").strip()
+            save_current_task(task)
+            speak(f"Got it, I'll remember you're working on {task}.")
+
+        elif "open browser" in command or "open chrome" in command:
+            webbrowser.open("https://www.google.com")
+            speak("Opening browser.")
+
+        elif "open youtube" in command or "youtube" in command:
+            webbrowser.open("https://www.youtube.com")
+            speak("It's opened.")
+
+        elif "open notepad" in command:
+            subprocess.Popen("notepad.exe")
+            speak("Opening Notepad.")
+
+        elif "play music" in command:
+            os.startfile("C:\\Users\\shash\\Music")
+            speak("Opening your music folder.")
+
+        elif "what is time" in command or "what time" in command:
+            speak(datetime.now().strftime("It's %I:%M %p"))
+
+        elif "open file explorer" in command:
+            os.startfile("C:\\Users\\shash")
+            speak("Opening file explorer.")
+
+        elif "search for" in command or "google" in command:
+            query = command.replace("search for", "").replace("google", "").strip()
+            speak("Let me check.")
+            result = search_google(query)
+            speak(result)
+
+        elif "weather" in command:
+            speak("Checking the weather.")
+            result = get_weather("Bengaluru")
+            speak(result)
+
+        elif "close" in command:
+            app_name = command.replace("close", "").strip()
+            result = close_app(app_name)
+            speak(result)
+
+        elif "talk slower" in command or "speak slower" in command:
+            SPEECH_RATE = "-20%"
+            speak("Okay, slowing down a bit.")
+
+        elif "talk faster" in command or "speak faster" in command:
+            SPEECH_RATE = "+20%"
+            speak("Sure, speeding up.")
+
+        elif "speak up" in command or "louder" in command:
+            SPEECH_VOLUME = "+50%"
+            speak("Got it, talking louder now.")
+
+        elif "speak quieter" in command or "lower your voice" in command:
+            SPEECH_VOLUME = "-50%"
+            speak("Okay, quieter now.")
+
+        elif any(place in command for place in KNOWN_PLACES) and "open" in command:
+            for place, path in KNOWN_PLACES.items():
+                if place in command:
+                    os.startfile(path)
+                    speak(f"Opening {place}.")
+                    break
+
+        else:
+            reply = ask_ai(command)
+            speak(reply)
+
+# ---------------- Start everything ----------------
+assistant_thread = threading.Thread(target=run_assistant, daemon=True)
+assistant_thread.start()
+
+gui.run()
+with sr.Microphone() as source:
+    print("Say something...")
+    recognizer.adjust_for_ambient_noise(source)
+    audio = recognizer.listen(source, timeout=5)
+    print("Got audio, recognizing...")
+
+try:
+    text = recognizer.recognize_google(audio)
+    print(f"You said: {text}")
+except Exception as e:
+    print(f"Error type: {type(e).__name__}")
+    print(f"Error details: {repr(e)}")
