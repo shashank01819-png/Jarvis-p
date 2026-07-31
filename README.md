@@ -19,7 +19,7 @@ It features a minimal GUI, speech recognition, text-to-speech, reminders, and si
 ---
 
 ## 🛠️ Requirements
-- Python 3.9+
+- Python 3.12+
 - Libraries:  
   `speech_recognition`, `edge-tts`, `pygame`, `requests`, `tkinter`
 
