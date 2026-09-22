@@ -1,0 +1,976 @@
+from datetime import datetime, date, timedelta
+from functools import wraps
+import os
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import false
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-secret-key")
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "academic_portal.db")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "static", "uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "ppt", "pptx", "png", "jpg", "jpeg"}
+
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+
+class Section(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), unique=True, nullable=False)
+
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    college_id = db.Column(db.String(50), unique=True, nullable=False)
+    full_name = db.Column(db.String(120), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+
+    section_id = db.Column(
+        db.Integer,
+        db.ForeignKey("section.id"),
+        nullable=True
+    )
+
+    section = db.relationship("Section")
+
+    is_admin = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class Subject(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    code = db.Column(db.String(30), unique=True, nullable=False)
+    name = db.Column(db.String(150), nullable=False)
+    faculty = db.Column(db.String(150), default="")
+    credits = db.Column(db.Integer, default=3)
+    color = db.Column(db.String(20), default="#6d5dfc")
+
+
+class Schedule(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+
+    # NEW
+    section_id = db.Column(
+        db.Integer,
+        db.ForeignKey("section.id"),
+        nullable=False
+    )
+
+    day = db.Column(db.Integer, nullable=False)  # Monday=0
+    start_time = db.Column(db.String(5), nullable=False)
+    end_time = db.Column(db.String(5), nullable=False)
+    subject_id = db.Column(db.Integer, db.ForeignKey("subject.id"), nullable=True)
+    title = db.Column(db.String(150), default="")
+    kind = db.Column(db.String(30), default="class")
+    room = db.Column(db.String(50), default="")
+
+    subject = db.relationship("Subject")
+    section = db.relationship("Section")
+
+
+class Attendance(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    schedule_id = db.Column(db.Integer, db.ForeignKey("schedule.id"), nullable=False)
+    session_date = db.Column(db.Date, nullable=False)
+    status = db.Column(db.String(20), nullable=False)  # present, absent, pending, excused
+    marked_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user = db.relationship("User")
+    schedule = db.relationship("Schedule")
+
+
+class Result(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    semester = db.Column(db.String(30), nullable=False)
+    subject_code = db.Column(db.String(30), nullable=False)
+    subject_name = db.Column(db.String(150), nullable=False)
+    grade = db.Column(db.String(10), default="")
+    marks = db.Column(db.Float, nullable=True)
+    credits = db.Column(db.Integer, default=3)
+    user = db.relationship("User")
+
+
+class Notification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    message = db.Column(db.String(500), nullable=False)
+    kind = db.Column(db.String(30), default="info")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    read = db.Column(db.Boolean, default=False)
+
+
+class Note(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    subject_id = db.Column(db.Integer, db.ForeignKey("subject.id"), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.String(500), default="")
+    filename = db.Column(db.String(255), nullable=False)
+    uploaded_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+    subject = db.relationship("Subject")
+    uploader = db.relationship("User")
+
+
+class QuestionPaper(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    subject_id = db.Column(db.Integer, db.ForeignKey("subject.id"), nullable=False)
+    year = db.Column(db.String(10), nullable=False)
+    exam_type = db.Column(db.String(50), default="")  # e.g. Mid-sem, End-sem, Model
+    filename = db.Column(db.String(255), nullable=False)
+    uploaded_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+    subject = db.relationship("Subject")
+    uploader = db.relationship("User")
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return db.session.get(User, int(user_id))
+
+def seed_data():
+
+    # Create sections
+    section_names = ["A", "B", "C", "D"]
+
+    for name in section_names:
+        if not Section.query.filter_by(name=name).first():
+            db.session.add(Section(name=name))
+
+    db.session.commit()
+
+    sections = {
+        section.name: section
+        for section in Section.query.all()
+    }
+
+    if not User.query.filter_by(college_id="ADMIN").first():
+        admin = User(college_id="ADMIN", full_name="Administrator", is_admin=True)
+        admin.set_password("admin123")
+        db.session.add(admin)
+
+    if Subject.query.count() == 0:
+        subjects = [
+            ("MVJ22AE51", "Aviation Management", "Prof. Vijay Judges", 3),
+            ("MVJ22AE52", "Fundamentals of Aircraft Structures", "Prof. Goofy Rohan", 4),
+            ("MVJ22AE52B", "Fundamentals of Aircraft Structures (Lab)", "Dr. Vijaya Kumar R", 2),
+            ("MVJ22AE53", "Compressible Aerodynamics", "Dr. Rohini D", 3),
+            ("MVJ22AE54", "Mechanical Measurement and Metrology", "Ms. Jaseel", 3),
+            ("MVJ22AE55", "Rocket & Missiles", "Dr. R K Mishra", 3),
+            ("MVJ22AE56", "Mini Project", "Prof. Goofy Rohan", 2),
+            ("MVJ22RM57", "Research Methodology and IPR", "Dr. Anindita Mondal", 3),
+            ("MVJ22EN58", "Environmental Studies", "Prof. Asa Fathima", 2),
+            ("MVJ22YO59", "Yoga", "", 1),
+        ]
+        for code, name, faculty, credits in subjects:
+            db.session.add(Subject(code=code, name=name, faculty=faculty, credits=credits))
+
+    db.session.commit()
+
+    if Schedule.query.count() == 0:
+        by_code = {s.code: s.id for s in Subject.query.all()}
+        rows = [
+            (0, "08:00", "09:00", "MVJ22RM57", "class"),
+            (0, "09:30", "10:30", "MVJ22AE53", "class"),
+            (0, "10:30", "11:30", "MVJ22AE51", "class"),
+            (0, "11:40", "12:40", "MVJ22AE52", "class"),
+            (0, "13:30", "14:30", "MVJ22AE56", "project"),
+            (0, "14:30", "15:30", "MVJ22AE56", "project"),
+
+            (1, "08:00", "09:00", "MVJ22AE52", "class"),
+            (1, "09:30", "10:30", "MVJ22EN58", "class"),
+            (1, "10:30", "12:40", "MVJ22AE52B", "lab"),
+            (1, "13:30", "14:30", "MVJ22RM57", "class"),
+            (1, "14:30", "15:30", "MVJ22AE53", "class"),
+
+            (2, "08:00", "10:30", "MVJ22AE52B", "lab"),
+            (2, "10:30", "11:30", "MVJ22AE51", "class"),
+            (2, "11:40", "12:40", "MVJ22AE55", "class"),
+            (2, "13:30", "15:30", "", "break"),
+
+            (3, "08:00", "10:00", "MVJ22YO59", "class"),
+            (3, "10:30", "11:30", "MVJ22AE52", "class"),
+            (3, "11:40", "12:40", "MVJ22AE55", "class"),
+            (3, "13:30", "14:30", "MVJ22AE51", "class"),
+            (3, "14:30", "15:30", "MVJ22AE53", "class"),
+
+            (4, "08:00", "09:00", "MVJ22AE55", "class"),
+            (4, "09:00", "10:30", "MVJ22AE55", "class"),
+            (4, "10:30", "11:30", "MVJ22RM57", "class"),
+            (4, "11:40", "12:40", "MVJ22AE53", "class"),
+            (4, "13:30", "14:30", "MVJ22EN58", "class"),
+            (4, "14:30", "15:30", "MVJ22AE56", "project"),
+
+            (5, "08:00", "09:00", "MVJ22AE51", "class"),
+            (5, "09:30", "10:30", "MVJ22AE53", "class"),
+            (5, "10:30", "11:30", "MVJ22RM57", "class"),
+            (5, "11:40", "12:40", "MVJ22AE52", "class"),
+            (5, "13:30", "14:30", "MVJ22AE56", "project"),
+            (5, "14:30", "15:30", "MVJ22AE56", "project"),
+        ]
+        # Create the same initial timetable for every section
+        for section in sections.values():
+
+            for day, start, end, code, kind in rows:
+                db.session.add(Schedule(
+                    section_id=section.id,
+                    day=day,
+                    start_time=start,
+                    end_time=end,
+                    subject_id=by_code.get(code),
+                    kind=kind,
+                    title="Break" if kind == "break" else ""
+                ))
+
+        db.session.commit()
+
+
+def attendance_stats(user_id, start=None, end=None):
+    q = Attendance.query.filter_by(user_id=user_id)
+    if start:
+        q = q.filter(Attendance.session_date >= start)
+    if end:
+        q = q.filter(Attendance.session_date <= end)
+    records = q.all()
+    classes = [r for r in records if r.status in ("present", "absent")]
+    present = sum(r.status == "present" for r in classes)
+    absent = sum(r.status == "absent" for r in classes)
+    total = present + absent
+    pct = round((present / total) * 100, 1) if total else 0
+    return {"present": present, "absent": absent, "total": total, "percentage": pct}
+
+
+@app.route("/")
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    return render_template("landing.html")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        college_id = request.form["college_id"].strip().upper()
+        full_name = request.form["full_name"].strip()
+        password = request.form["password"]
+        section_name = request.form.get("section", "").strip().upper()
+
+        section = Section.query.filter_by(
+            name=section_name
+        ).first()
+
+        if not section:
+            flash("Please select a valid section.", "error")
+            return redirect(url_for("register"))
+        if User.query.filter_by(college_id=college_id).first():
+            flash("That college ID is already registered.", "error")
+            return redirect(url_for("register"))
+        if len(password) < 6:
+            flash("Password must be at least 6 characters.", "error")
+            return redirect(url_for("register"))
+        user = User(
+            college_id=college_id,
+            full_name=full_name,
+            section_id=section.id
+        )
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
+        login_user(user)
+        flash("Account created. Welcome!", "success")
+        return redirect(url_for("dashboard"))
+    return render_template("auth.html", mode="register")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        college_id = request.form["college_id"].strip().upper()
+        password = request.form["password"]
+
+        section_name = request.form.get("section", "").strip().upper()
+
+        user = User.query.filter_by(
+            college_id=college_id
+        ).first()
+
+        section = Section.query.filter_by(
+            name=section_name
+        ).first()
+        if (
+                not user
+                or not user.check_password(password)
+                or not section
+                or user.section_id != section.id
+        ):
+            flash("Invalid college ID or password.", "error")
+            return redirect(url_for("login"))
+        login_user(user, remember=True)
+        return redirect(url_for("dashboard"))
+    return render_template("auth.html", mode="login")
+
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("index"))
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    today = date.today()
+    weekday = today.weekday()
+    schedule = Schedule.query.filter_by(
+        day=weekday,
+        section_id=current_user.section_id
+    ).order_by(
+        Schedule.start_time
+    ).all()
+    stats = attendance_stats(current_user.id)
+    today_records = {
+        a.schedule_id: a.status
+        for a in Attendance.query.filter_by(user_id=current_user.id, session_date=today).all()
+    }
+    notifications = Notification.query.filter_by(user_id=current_user.id).order_by(Notification.created_at.desc()).limit(8).all()
+    return render_template("dashboard.html", schedule=schedule, stats=stats,
+                           today_records=today_records, notifications=notifications,
+                           today=today, weekday=weekday)
+
+
+@app.route("/attendance")
+@login_required
+def attendance():
+
+    selected_date_text = request.args.get(
+        "date",
+        str(date.today())
+    )
+
+    try:
+        selected_date = date.fromisoformat(
+            selected_date_text
+        )
+    except ValueError:
+        selected_date = date.today()
+
+    schedules = Schedule.query.filter_by(
+        day=selected_date.weekday(),
+        section_id=current_user.section_id
+    ).order_by(
+        Schedule.start_time
+    ).all()
+    existing_records = Attendance.query.filter_by(
+        user_id=current_user.id,
+        session_date=selected_date
+    ).all()
+
+    attendance_map = {
+        record.schedule_id: record.status
+        for record in existing_records
+    }
+
+    stats = attendance_stats(current_user.id)
+
+    records = Attendance.query.filter_by(
+        user_id=current_user.id
+    ).order_by(
+        Attendance.session_date.desc(),
+        Attendance.id.desc()
+    ).all()
+
+    return render_template(
+        "attendance.html",
+        stats=stats,
+        records=records,
+        schedules=schedules,
+        attendance_map=attendance_map,
+        selected_date=selected_date,
+        selected_date_text=selected_date.isoformat()
+    )
+
+
+@app.post("/attendance/mark")
+@login_required
+def mark_attendance():
+    """
+    Create or edit attendance for ANY date.
+
+    This is what allows the user to enter attendance from previous
+    classes instead of being restricted to today's date.
+    """
+
+    data = request.get_json(silent=True) or request.form
+
+    try:
+        schedule_id = int(data["schedule_id"])
+        session_date = date.fromisoformat(
+            data.get("session_date", str(date.today()))
+        )
+        status = data["status"]
+    except (KeyError, ValueError, TypeError):
+        return jsonify({
+            "ok": False,
+            "error": "Invalid attendance data."
+        }), 400
+
+    if status not in ("present", "absent", "excused"):
+        return jsonify({
+            "ok": False,
+            "error": "Invalid attendance status."
+        }), 400
+
+    # Get the schedule/class being marked
+    schedule = Schedule.query.filter_by(
+        id=schedule_id
+    ).first()
+
+    if not schedule:
+        return jsonify({
+            "ok": False,
+            "error": "Class not found."
+        }), 404
+
+    # Make sure the class belongs to the user's section
+    if schedule.section_id != current_user.section_id:
+        return jsonify({
+            "ok": False,
+            "error": "This class belongs to another section."
+        }), 403
+
+    if schedule.day != session_date.weekday():
+        return jsonify({
+            "ok": False,
+            "error": "This class is not scheduled on that date."
+        }), 400
+
+    if not schedule:
+        return jsonify({
+            "ok": False,
+            "error": "Class not found."
+        }), 404
+
+    if schedule.day != session_date.weekday():
+        return jsonify({
+            "ok": False,
+            "error": "This class is not scheduled on that date."
+        }), 400
+
+    record = Attendance.query.filter_by(
+        user_id=current_user.id,
+        schedule_id=schedule_id,
+        session_date=session_date
+    ).first()
+
+    if not record:
+        record = Attendance(
+            user_id=current_user.id,
+            schedule_id=schedule_id,
+            session_date=session_date,
+            status=status
+        )
+        db.session.add(record)
+    else:
+        record.status = status
+
+    record.marked_at = datetime.utcnow()
+
+    db.session.commit()
+
+    stats = attendance_stats(current_user.id)
+
+    return jsonify({
+        "ok": True,
+        "status": status,
+        "date": session_date.isoformat(),
+        "stats": stats
+    })
+
+
+@app.route("/attendance/edit/<int:aid>", methods=["GET", "POST"])
+@login_required
+def edit_attendance(aid):
+    record = Attendance.query.filter_by(id=aid, user_id=current_user.id).first_or_404()
+
+    if request.method == "POST":
+        status = request.form.get("status")
+        if status not in ("present", "absent", "excused"):
+            flash("Invalid status.", "error")
+            return redirect(url_for("edit_attendance", aid=aid))
+        record.status = status
+        record.marked_at = datetime.utcnow()
+        db.session.commit()
+        flash("Attendance record updated.", "success")
+        return redirect(url_for("attendance", date=record.session_date.isoformat()))
+
+    return render_template("edit_attendance.html", record=record)
+
+
+@app.post("/attendance/save-day")
+@login_required
+def save_attendance_day():
+
+    session_date_text = request.form.get("session_date")
+
+    if not session_date_text:
+        flash("Please select a date.", "error")
+        return redirect(url_for("attendance"))
+
+    try:
+        session_date = date.fromisoformat(
+            session_date_text
+        )
+    except ValueError:
+        flash("Invalid date.", "error")
+        return redirect(url_for("attendance"))
+
+    schedules = Schedule.query.filter_by(
+        day=session_date.weekday(),
+        section_id=current_user.section_id
+    ).order_by(
+        Schedule.start_time
+    ).all()
+
+    for schedule in schedules:
+
+        if schedule.kind == "break":
+            continue
+
+        field_name = f"status_{schedule.id}"
+
+        status = request.form.get(field_name)
+
+        if not status:
+            continue
+
+        if status not in (
+            "present",
+            "absent",
+            "excused"
+        ):
+            continue
+
+        record = Attendance.query.filter_by(
+            user_id=current_user.id,
+            schedule_id=schedule.id,
+            session_date=session_date
+        ).first()
+
+        if not record:
+
+            record = Attendance(
+                user_id=current_user.id,
+                schedule_id=schedule.id,
+                session_date=session_date,
+                status=status
+            )
+
+            db.session.add(record)
+
+        else:
+
+            record.status = status
+
+        record.marked_at = datetime.utcnow()
+
+    db.session.commit()
+
+    flash(
+        f"Attendance saved for "
+        f"{session_date.strftime('%d %B %Y')}.",
+        "success"
+    )
+
+    return redirect(
+        url_for(
+            "attendance",
+            date=session_date.isoformat()
+        )
+    )
+
+
+@app.route("/results")
+@login_required
+def results():
+    rows = Result.query.filter_by(user_id=current_user.id).order_by(Result.semester, Result.id).all()
+    return render_template("results.html", results=rows)
+
+
+@app.post("/results/save")
+@login_required
+def save_result():
+    rid = request.form.get("id")
+    data = dict(
+        semester=request.form["semester"].strip(),
+        subject_code=request.form["subject_code"].strip().upper(),
+        subject_name=request.form["subject_name"].strip(),
+        grade=request.form.get("grade", "").strip().upper(),
+        marks=float(request.form["marks"]) if request.form.get("marks") else None,
+        credits=int(request.form.get("credits", 3))
+    )
+    if rid:
+        row = Result.query.filter_by(id=int(rid), user_id=current_user.id).first_or_404()
+        for k, v in data.items():
+            setattr(row, k, v)
+    else:
+        db.session.add(Result(user_id=current_user.id, **data))
+    db.session.commit()
+    flash("Academic result saved.", "success")
+    return redirect(url_for("results"))
+
+
+@app.post("/results/delete/<int:rid>")
+@login_required
+def delete_result(rid):
+    row = Result.query.filter_by(id=rid, user_id=current_user.id).first_or_404()
+    db.session.delete(row)
+    db.session.commit()
+    return redirect(url_for("results"))
+
+
+@app.route("/timetable")
+@login_required
+def timetable():
+    schedules = Schedule.query.filter_by(
+        section_id=current_user.section_id
+    ).order_by(
+        Schedule.day,
+        Schedule.start_time
+    ).all()
+
+    subjects = Subject.query.order_by(
+        Subject.code
+    ).all()
+
+    return render_template(
+        "timetable.html",
+        schedules=schedules,
+        subjects=subjects
+    )
+
+@app.post("/timetable/save")
+@login_required
+def save_timetable():
+    sid = request.form.get("id")
+    day = int(request.form["day"])
+    start = request.form["start_time"]
+    end = request.form["end_time"]
+    subject_id = int(request.form["subject_id"]) if request.form.get("subject_id") else None
+    kind = request.form.get("kind", "class")
+    title = request.form.get("title", "")
+    room = request.form.get("room", "")
+    if sid:
+        row = Schedule.query.filter_by(
+            id=int(sid),
+            section_id=current_user.section_id
+        ).first_or_404()
+
+    else:
+        row = Schedule(
+            section_id=current_user.section_id
+        )
+        db.session.add(row)
+    row.day, row.start_time, row.end_time = day, start, end
+    row.subject_id, row.kind, row.title, row.room = subject_id, kind, title, room
+    db.session.commit()
+    flash("Timetable updated.", "success")
+    return redirect(url_for("timetable"))
+
+
+@app.post("/timetable/delete/<int:sid>")
+@login_required
+def delete_timetable(sid):
+    row = Schedule.query.filter_by(
+        id=sid,
+        section_id=current_user.section_id
+    ).first_or_404()
+    Attendance.query.filter_by(schedule_id=sid).delete()
+    db.session.delete(row)
+    db.session.commit()
+    return redirect(url_for("timetable"))
+
+
+@app.route("/notes")
+@login_required
+def notes():
+    subject_id = request.args.get("subject_id", type=int)
+    q = Note.query
+    if subject_id:
+        q = q.filter_by(subject_id=subject_id)
+    all_notes = q.order_by(Note.uploaded_at.desc()).all()
+    subjects = Subject.query.order_by(Subject.code).all()
+    return render_template("notes.html", notes=all_notes, subjects=subjects, selected_subject_id=subject_id)
+
+
+@app.post("/notes/upload")
+@login_required
+def upload_note():
+    file = request.files.get("file")
+    subject_id = request.form.get("subject_id")
+    title = request.form.get("title", "").strip()
+
+    if not file or file.filename == "" or not allowed_file(file.filename):
+        flash("Please choose a valid file (pdf, doc, docx, ppt, pptx, image).", "error")
+        return redirect(url_for("notes"))
+    if not subject_id or not title:
+        flash("Subject and title are required.", "error")
+        return redirect(url_for("notes"))
+
+    safe_name = secure_filename(file.filename)
+    unique_name = f"{datetime.utcnow().timestamp():.0f}_{safe_name}"
+    file.save(os.path.join(app.config["UPLOAD_FOLDER"], unique_name))
+
+    note = Note(
+        subject_id=int(subject_id),
+        title=title,
+        description=request.form.get("description", "").strip(),
+        filename=unique_name,
+        uploaded_by=current_user.id
+    )
+    db.session.add(note)
+    db.session.commit()
+    flash("Note uploaded.", "success")
+    return redirect(url_for("notes"))
+
+
+@app.post("/notes/delete/<int:nid>")
+@login_required
+def delete_note(nid):
+    note = Note.query.filter_by(id=nid, uploaded_by=current_user.id).first_or_404()
+    try:
+        os.remove(os.path.join(app.config["UPLOAD_FOLDER"], note.filename))
+    except OSError:
+        pass
+    db.session.delete(note)
+    db.session.commit()
+    flash("Note deleted.", "success")
+    return redirect(url_for("notes"))
+
+
+@app.route("/question-papers")
+@login_required
+def question_papers():
+    subject_id = request.args.get("subject_id", type=int)
+    q = QuestionPaper.query
+    if subject_id:
+        q = q.filter_by(subject_id=subject_id)
+    papers = q.order_by(QuestionPaper.year.desc()).all()
+    subjects = Subject.query.order_by(Subject.code).all()
+    return render_template("question_papers.html", papers=papers, subjects=subjects, selected_subject_id=subject_id)
+
+
+@app.post("/question-papers/upload")
+@login_required
+def upload_question_paper():
+    file = request.files.get("file")
+    subject_id = request.form.get("subject_id")
+    year = request.form.get("year", "").strip()
+
+    if not file or file.filename == "" or not allowed_file(file.filename):
+        flash("Please choose a valid file.", "error")
+        return redirect(url_for("question_papers"))
+    if not subject_id or not year:
+        flash("Subject and year are required.", "error")
+        return redirect(url_for("question_papers"))
+
+    safe_name = secure_filename(file.filename)
+    unique_name = f"{datetime.utcnow().timestamp():.0f}_{safe_name}"
+    file.save(os.path.join(app.config["UPLOAD_FOLDER"], unique_name))
+
+    paper = QuestionPaper(
+        subject_id=int(subject_id),
+        year=year,
+        exam_type=request.form.get("exam_type", "").strip(),
+        filename=unique_name,
+        uploaded_by=current_user.id
+    )
+    db.session.add(paper)
+    db.session.commit()
+    flash("Question paper uploaded.", "success")
+    return redirect(url_for("question_papers"))
+
+
+@app.post("/question-papers/delete/<int:pid>")
+@login_required
+def delete_question_paper(pid):
+    paper = QuestionPaper.query.filter_by(id=pid, uploaded_by=current_user.id).first_or_404()
+    try:
+        os.remove(os.path.join(app.config["UPLOAD_FOLDER"], paper.filename))
+    except OSError:
+        pass
+    db.session.delete(paper)
+    db.session.commit()
+    flash("Question paper deleted.", "success")
+    return redirect(url_for("question_papers"))
+
+
+@app.route("/api/today")
+@login_required
+def api_today():
+    today = date.today()
+    rows = Schedule.query.filter_by(
+        day=today.weekday(),
+        section_id=current_user.section_id
+    ).order_by(
+        Schedule.start_time
+    ).all()
+    marked = {a.schedule_id: a.status for a in Attendance.query.filter_by(
+        user_id=current_user.id, session_date=today).all()}
+    return jsonify([
+        {
+            "id": s.id,
+            "start": s.start_time,
+            "end": s.end_time,
+            "subject": s.subject.name if s.subject else s.title or s.kind.title(),
+            "code": s.subject.code if s.subject else "",
+            "status": marked.get(s.id)
+        } for s in rows
+    ])
+
+
+@app.route("/api/notifications")
+@login_required
+def api_notifications():
+    notes_q = Notification.query.filter_by(user_id=current_user.id, read=False).order_by(
+        Notification.created_at.desc()).limit(20).all()
+    return jsonify([{"id": n.id, "message": n.message, "kind": n.kind} for n in notes_q])
+
+
+@app.post("/api/notifications/<int:nid>/read")
+@login_required
+def read_notification(nid):
+    n = Notification.query.filter_by(id=nid, user_id=current_user.id).first_or_404()
+    n.read = True
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/profile")
+@login_required
+def profile():
+    data = request.form
+    current_user.full_name = data.get("full_name", current_user.full_name).strip()
+    if data.get("new_password"):
+        if len(data["new_password"]) < 6:
+            flash("New password must be at least 6 characters.", "error")
+            return redirect(url_for("dashboard"))
+        current_user.set_password(data["new_password"])
+    db.session.commit()
+    flash("Profile updated.", "success")
+    return redirect(url_for("dashboard"))
+
+
+def create_daily_notifications():
+    with app.app_context():
+        users = User.query.all()
+        today = date.today()
+        for user in users:
+            if Notification.query.filter(
+                Notification.user_id == user.id,
+                Notification.message.like(f"%{today.strftime('%d %b %Y')}%")
+            ).first():
+                continue
+            stats = attendance_stats(user.id)
+            if stats["total"]:
+                msg = f"Daily attendance • {today.strftime('%d %b %Y')}: {stats['percentage']}% ({stats['present']}/{stats['total']})"
+                db.session.add(Notification(user_id=user.id, message=msg, kind="attendance"))
+        db.session.commit()
+
+
+def create_missed_class_notifications():
+    with app.app_context():
+
+        today = date.today()
+        now = datetime.now().strftime("%H:%M")
+
+        for user in User.query.all():
+
+            if not user.section_id:
+                continue
+
+            sessions = Schedule.query.filter_by(
+                day=today.weekday(),
+                section_id=user.section_id
+            ).all()
+
+            for s in sessions:
+
+                if s.kind == "break":
+                    continue
+
+                if now >= s.end_time:
+
+                    record = Attendance.query.filter_by(
+                        user_id=user.id,
+                        schedule_id=s.id,
+                        session_date=today
+                    ).first()
+
+                    if not record:
+
+                        existing = Notification.query.filter_by(
+                            user_id=user.id,
+                            kind=f"class-{s.id}-{today.isoformat()}"
+                        ).first()
+
+                        if not existing:
+
+                            label = (
+                                s.subject.name
+                                if s.subject
+                                else s.title or "Scheduled session"
+                            )
+
+                            db.session.add(
+                                Notification(
+                                    user_id=user.id,
+                                    message=(
+                                        f"Attendance check: Did you attend "
+                                        f"{label} "
+                                        f"({s.start_time}–{s.end_time})?"
+                                    ),
+                                    kind=f"class-{s.id}-{today.isoformat()}"
+                                )
+                            )
+
+        db.session.commit()
+
+with app.app_context():
+    db.create_all()
+    seed_data()
+
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.add_job(create_daily_notifications, "cron", hour=18, minute=0)
+scheduler.add_job(create_missed_class_notifications, "interval", minutes=5)
+scheduler.start()
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=True
+    )
